@@ -1,19 +1,21 @@
 
 // ================================
 
-//          센서 연결 테스트
+//     심박센서를 이용한 측정 테스트
 
 // ================================
 
 // ========== 예제 특징 ============
 
-//  시리얼 모니터로 Sensor 연결을 확인합니다.
+//  심박센서는 시리얼 모니터로 확인 합니다.
 
 // ================================
 
 
-// ======== 사용 라이브러리 ========= 
-// MAX30100_milan : 1.3.0
+// ======== 사용 라이브러리 =========
+// // MAX30100_milan : 1.3.0
+// (이 예제는 MAX30100 심박센서를
+// 사용하지 않는 관계로 아래 라이브러리만 사용합니다.)
 // Adafruit_GFX : 1.12.1
 // Adafruit_SSD1306 : 2.5.13
 // =================================
@@ -25,7 +27,6 @@
 #include <Adafruit_SSD1306.h> // OLED 드라이버
 #include "MAX30100.h" //센서 라이브러리
 
-
 // ============ 장치 설정 ==========
 
 #define LED1 25
@@ -36,6 +37,7 @@
 #define BTN3   34
 #define BTN4   35
 
+#define HEART_RATE   32 //심박센서 핀번호
 
 //  - OLED I2C 핀 (Wire1) (보드에 따라 변경 가능)
 //    예: ESP32에서 SDA=16, SCL=17 처럼 자유롭게 매핑 가능
@@ -56,19 +58,41 @@
 #define TEST_LED_BLINK    0 
 #define TEST_BTN_INPUT    0
 #define TEST_OLED_DISPLAY 0
-#define TEST_MAX30100     1
+#define TEST_MAX30100     0
+#define TEST_HEART_RATE   1
 
 // ======== 논블로킹 주기 제어 ======
 
 #define TEST_INTERVAL 500 // 주기를 만들기위해서 선언 (500ms)
 
+// ======== 심박 관련 변수 ===========
+
+#define SAMPLING_RATE       MAX30100_SAMPRATE_100HZ
+#define IR_LED_CURRENT      MAX30100_LED_CURR_24MA
+#define RED_LED_CURRENT     MAX30100_LED_CURR_11MA
+#define PULSE_WIDTH         MAX30100_SPC_PW_1600US_16BITS
+#define HIGHRES_MODE        true
+
+
+// ============ BPM 계산 관련 변수 (당신 데이터 기준) ==============
+#define SAMPLE_SIZE         20           
+#define MIN_BPM             50
+#define MAX_BPM             180
+#define BEAT_THRESHOLD    1500     
+
+static uint16_t irBuffer[SAMPLE_SIZE];
+static int bufferIndex = 0;
+static bool bufferFilled = false;
+static uint32_t lastPeakTime = 0;
+static bool beatDetected = false;
+
 // ======== OLED 설정 ==============
 
 //  - 해상도와 I2C 주소 설정 (대부분 0x3C, 가끔 0x3D인 모듈도 있음)
 
-#define SCREEN_WIDTH  128  // OLED 가로 해상도
-#define SCREEN_HEIGHT 64  // OLED 세로 해상도
-#define OLED_ADDR     0x3C
+#define SCREEN_WIDTH    128  // OLED 가로 해상도
+#define SCREEN_HEIGHT   64  // OLED 세로 해상도
+#define OLED_ADDR       0x3C
 
 // ======= OLED 초기화 =============
 
@@ -78,8 +102,11 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire1, -1);  // 리셋 핀 -1 (없음)
 
+
 // MAX30100 인스턴스 (기본 Wire 버스를 사용)
 MAX30100 sensor;
+
+
 
 void setup() 
 {
@@ -92,6 +119,7 @@ ledBlinkInit(); //  LED Blink Init
 btnInputInit(); // Button Input Init
 oledDisplayInit(); // OLED Play Init
 max30100TestInit(); // MAX30100 센서 연결 테스트
+heartRateInit(); // 심박측정 테스트
 
 }
 
@@ -100,6 +128,7 @@ void loop()
   
 ledBlinkTask();
 btnInputTask();
+heartRateTask();
 
 }
 
@@ -267,6 +296,132 @@ void max30100TestInit()
     Serial.println("Success");
   }
 #endif
+}
+
+//
+//////////////////////////////////////////////////////////////////////////////////////////
+//
+
+
+void heartRateInit()
+{
+#if TEST_HEART_RATE
+ Serial.print("Initializing MAX30100..");
+  if (!sensor.begin()) 
+  {
+    Serial.println("FAILED");
+    while(1);
+  } 
+  else 
+  {
+    Serial.println("SUCCESS");
+  }
+  sensor.setMode(MAX30100_MODE_SPO2_HR);
+  sensor.setLedsCurrent(IR_LED_CURRENT, RED_LED_CURRENT);
+  sensor.setLedsPulseWidth(PULSE_WIDTH);
+  sensor.setSamplingRate(SAMPLING_RATE);
+  sensor.setHighresModeEnabled(HIGHRES_MODE);
+  
+#endif
+}
+
+void heartRateTask()
+{
+#if TEST_HEART_RATE
+  static uint32_t ts = millis();
+  uint16_t ir, red;
+  sensor.update();
+
+  while (sensor.getRawValues(&ir, &red)) {
+    int bpm = calculateBPM(ir);
+    
+    // 1초마다 출력
+    if (millis() - ts >= 1000) {
+      ts += 1000;
+      
+      if (bpm > 0) {
+        Serial.print("BPM="); Serial.print(bpm);
+      } else {
+        Serial.print("BPM=측정중");
+      }
+      Serial.print(" IR="); Serial.print(ir);
+      Serial.print(" RED="); Serial.println(red);
+    }
+  }
+#endif
+}
+//
+//////////////////////////////////////////////////////////////////////////////////////////
+//
+
+int calculateBPM(uint16_t irValue) 
+{
+  // 버퍼에 새로운 값 저장
+  irBuffer[bufferIndex] = irValue;
+  bufferIndex = (bufferIndex + 1) % SAMPLE_SIZE;
+  
+  if (bufferIndex == 0) {
+    bufferFilled = true;
+  }
+  
+  if (!bufferFilled) {
+    return 0;  // 워밍업 중
+  }
+  
+  // 이동평균 계산
+  uint32_t sum = 0;
+  for (int i = 0; i < SAMPLE_SIZE; i++) {
+    sum += irBuffer[i];
+  }
+  uint16_t average = sum / SAMPLE_SIZE;
+  
+  // *** 디버깅 정보 출력 ***
+  static uint32_t debugTime = millis();
+  if (millis() - debugTime >= 2000) {  // 2초마다 디버깅 정보
+    debugTime += 2000;
+    Serial.print("DEBUG - IR="); Serial.print(irValue);
+    Serial.print(" AVG="); Serial.print(average);
+    Serial.print(" DIFF="); Serial.print((int)irValue - (int)average);
+    Serial.print(" THRESHOLD="); Serial.print(BEAT_THRESHOLD);
+    Serial.print(" beatDetected="); Serial.println(beatDetected ? "YES" : "NO");
+  }
+  
+  // 피크 검출 (당신 데이터 기준: 평균보다 1500 이상 높을 때)
+  if (irValue > (average + BEAT_THRESHOLD) && !beatDetected) {
+    uint32_t currentTime = millis();
+    
+    Serial.println("*** PEAK CONDITION MET! ***");  // 피크 조건 만족 확인
+    
+    // 최소 100ms 간격 (분당 600회 제한)
+    if (currentTime - lastPeakTime > 100) {
+      uint32_t beatInterval = currentTime - lastPeakTime;
+      lastPeakTime = currentTime;
+      
+      // BPM 계산
+      int bpm = 60000 / beatInterval;
+      
+      Serial.print("Beat interval: "); Serial.print(beatInterval);
+      Serial.print("ms, Calculated BPM: "); Serial.println(bpm);
+      
+      if (bpm >= MIN_BPM && bpm <= MAX_BPM) {
+        beatDetected = true;
+        Serial.println("*** VALID BPM DETECTED! ***");
+        return bpm;
+      } else {
+        Serial.println("BPM out of range");
+      }
+    } else {
+      Serial.println("Too soon since last beat");
+    }
+  }
+  
+  // 피크 끝 감지 (평균 아래로 떨어지면)
+  if (irValue < average && beatDetected) {
+    beatDetected = false;
+    Serial.println("Beat ended");
+  }
+  
+  return -1;  // 유효한 BPM 없음
 }
 
 //
